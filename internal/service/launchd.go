@@ -175,3 +175,25 @@ func (s *LaunchdService) Status() (*ServiceStatus, error) {
 func (s *LaunchdService) LogPath() string {
 	return filepath.Join(s.LogDir, "gcalsync.log")
 }
+
+// LastSuccessPath returns the path to the file that tracks the last successful sync.
+func LastSuccessPath(configDir string) string {
+	return filepath.Join(configDir, "last_success")
+}
+
+// WriteLastSuccess writes the current time to the last success file.
+func WriteLastSuccess(configDir string) error {
+	return os.WriteFile(LastSuccessPath(configDir), []byte(time.Now().Format(time.RFC3339)), 0o644)
+}
+
+// ReadLastSuccess reads the last successful sync time, or returns zero time if unavailable.
+func ReadLastSuccess(configDir string) (time.Time, error) {
+	data, err := os.ReadFile(LastSuccessPath(configDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	return time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+}

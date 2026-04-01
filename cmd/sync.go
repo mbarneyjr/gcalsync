@@ -8,6 +8,7 @@ import (
 
 	"github.com/mbarney/gcalsync/internal/auth"
 	"github.com/mbarney/gcalsync/internal/gcal"
+	"github.com/mbarney/gcalsync/internal/service"
 	syncpkg "github.com/mbarney/gcalsync/internal/sync"
 	"github.com/spf13/cobra"
 )
@@ -82,6 +83,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	if dryRun || plan.IsEmpty() {
 		if plan.IsEmpty() {
 			fmt.Println("gcalsync: no changes needed")
+			service.WriteLastSuccess(dir)
 		}
 		return nil
 	}
@@ -90,6 +92,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	result := engine.Apply(ctx, plan)
 
 	fmt.Printf("gcalsync: %d created, %d updated, %d deleted\n", result.Created, result.Updated, result.Deleted)
+
+	if len(result.Errors) == 0 {
+		service.WriteLastSuccess(dir)
+	}
 
 	if len(result.Errors) > 0 {
 		fmt.Printf("gcalsync: %d errors during apply:\n", len(result.Errors))

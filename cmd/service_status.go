@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/mbarney/gcalsync/internal/service"
 	"github.com/spf13/cobra"
@@ -40,6 +41,18 @@ func runServiceStatus(cmd *cobra.Command, args []string) error {
 		fmt.Println("Status: not running")
 	}
 	fmt.Printf("Last exit code: %d\n", status.LastExit)
+
+	dir := getConfigDir()
+	lastSuccess, err := service.ReadLastSuccess(dir)
+	if err != nil {
+		fmt.Println("Last successful sync: unknown")
+	} else if lastSuccess.IsZero() {
+		fmt.Println("Last successful sync: never")
+	} else {
+		ago := time.Since(lastSuccess).Truncate(time.Second)
+		fmt.Printf("Last successful sync: %s (%s ago)\n", lastSuccess.Format("Jan 2, 2006 3:04pm"), ago)
+	}
+
 	fmt.Printf("Logs: %s\n", svc.LogPath())
 	return nil
 }
