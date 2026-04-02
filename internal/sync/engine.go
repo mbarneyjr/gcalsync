@@ -222,11 +222,7 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 				continue
 			}
 
-			blockers, err := client.ListBlockers(ctx, calID)
-			if err != nil {
-				log.Printf("[%s/%s] error listing blockers: %v", accountName, calID, err)
-				continue
-			}
+			blockers := gcal.FilterBlockers(events)
 
 			if e.Verbose {
 				log.Printf("[%s/%s] found %d events, %d blockers", accountName, calID, len(events), len(blockers))
@@ -348,8 +344,32 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 			}
 			if b.ExtendedProperties != nil && b.ExtendedProperties.Private != nil {
 				if srcID := b.ExtendedProperties.Private[gcal.PropSourceEventID]; srcID != "" {
-					blockerBySourceID[srcID] = b
-					blockerByGoogleID[b.Id] = b
+					if existing, dup := blockerBySourceID[srcID]; dup {
+						// Duplicate blocker — keep the older one, delete the newer.
+						keep, remove := existing, b
+						if b.Created < existing.Created {
+							keep, remove = b, existing
+						}
+						blockerBySourceID[srcID] = keep
+						blockerByGoogleID[keep.Id] = keep
+						plan.Actions = append(plan.Actions, PlannedAction{
+							Action:        ActionDelete,
+							CalendarID:    destCalID,
+							AccountName:   destInfo.accountName,
+							EventID:       remove.Id,
+							SourceEventID: srcID,
+							Summary:       PropertyDiff{Old: remove.Summary},
+							Start:         PropertyDiff{Old: formatEventDateTime(remove.Start)},
+							End:           PropertyDiff{Old: formatEventDateTime(remove.End)},
+							Recurrence:    PropertyDiff{Old: formatRecurrence(remove.Recurrence)},
+						})
+						if e.Verbose {
+							log.Printf("[%s] removing duplicate blocker %s for source %s", destCalID, remove.Id, srcID)
+						}
+					} else {
+						blockerBySourceID[srcID] = b
+						blockerByGoogleID[b.Id] = b
+					}
 				}
 			}
 		}
@@ -495,6 +515,9 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 					parentEventID = existing.Id
 				}
 
+				// Compute expected end from parent duration offset.
+				expectedEnd := expectedInstanceEnd(parentDesired.start, parentDesired.end, di.originalStart)
+
 				action := PlannedAction{
 					Action:            ActionUpdateInstance,
 					CalendarID:        destCalID,
@@ -505,7 +528,7 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 					EventType:         di.eventType,
 					TimeZone:          di.timeZone,
 					Start:             PropertyDiff{Old: di.originalStart, New: di.start},
-					End:               PropertyDiff{Old: di.originalStart, New: di.end},
+					End:               PropertyDiff{Old: expectedEnd, New: di.end},
 					Summary:           PropertyDiff{Old: parentDesired.summary + BlockerSuffix, New: instanceSummary},
 					Description:       PropertyDiff{Old: parentDesired.description, New: di.description},
 					Color:             PropertyDiff{Old: BlockerColorID, New: BlockerColorID},
@@ -943,6 +966,30 @@ func computeInstanceID(parentID, originalStart string) string {
 		return ""
 	}
 	return parentID + "_" + t.UTC().Format("20060102T150405Z")
+}
+
+// expectedInstanceEnd computes the expected end time for a recurring instance
+// by applying the parent event's duration to the instance's original start time.
+// If times can't be parsed, it falls back to the instance original start.
+func expectedInstanceEnd(parentStart, parentEnd, instanceOriginalStart string) string {
+	// All-day events
+	if len(parentStart) == 10 && len(parentEnd) == 10 && len(instanceOriginalStart) == 10 {
+		ps, err1 := time.Parse("2006-01-02", parentStart)
+		pe, err2 := time.Parse("2006-01-02", parentEnd)
+		ios, err3 := time.Parse("2006-01-02", instanceOriginalStart)
+		if err1 == nil && err2 == nil && err3 == nil {
+			return ios.Add(pe.Sub(ps)).Format("2006-01-02")
+		}
+		return instanceOriginalStart
+	}
+	// Timed events
+	ps, err1 := time.Parse(time.RFC3339, parentStart)
+	pe, err2 := time.Parse(time.RFC3339, parentEnd)
+	ios, err3 := time.Parse(time.RFC3339, instanceOriginalStart)
+	if err1 == nil && err2 == nil && err3 == nil {
+		return ios.Add(pe.Sub(ps)).Format(time.RFC3339)
+	}
+	return instanceOriginalStart
 }
 
 // eventTimeZone extracts the timezone from a source event, preferring Start.TimeZone.

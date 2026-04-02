@@ -80,44 +80,35 @@ func (c *Client) ListEvents(ctx context.Context, calendarID string) ([]*calendar
 	return all, nil
 }
 
-func (c *Client) ListBlockers(ctx context.Context, calendarID string) ([]*calendar.Event, error) {
-	now := time.Now()
-	timeMin := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	timeMax := timeMin.AddDate(0, 2, 0)
-
-	var all []*calendar.Event
-	pageToken := ""
-	for {
-		if err := c.wait(ctx); err != nil {
-			return nil, err
+// FilterBlockers extracts blocker events from an event list. It identifies
+// blocker parents by the gcalsync extended property, then also includes any
+// instances of those parents (instances don't inherit extended properties).
+// This is preferred over a separate API call because it uses the same data set
+// as ListEvents, avoiding search index consistency issues.
+func FilterBlockers(events []*calendar.Event) []*calendar.Event {
+	// First pass: find parent blocker IDs.
+	parentIDs := make(map[string]bool)
+	for _, ev := range events {
+		if ev.RecurringEventId != "" {
+			continue
 		}
-		call := c.Service.Events.List(calendarID).
-			SingleEvents(false).
-			Q("[gcalsync]").
-			TimeMin(timeMin.Format(time.RFC3339)).
-			TimeMax(timeMax.Format(time.RFC3339)).
-			MaxResults(2500)
-		if pageToken != "" {
-			call = call.PageToken(pageToken)
-		}
-
-		result, err := call.Do()
-		if err != nil {
-			return nil, fmt.Errorf("listing blockers for %s: %w", calendarID, err)
-		}
-
-		for _, ev := range result.Items {
-			if strings.Contains(ev.Summary, "[gcalsync]") {
-				all = append(all, ev)
+		if ev.ExtendedProperties != nil && ev.ExtendedProperties.Private != nil {
+			if _, ok := ev.ExtendedProperties.Private[PropSourceEventID]; ok {
+				parentIDs[ev.Id] = true
 			}
 		}
-
-		if result.NextPageToken == "" {
-			break
-		}
-		pageToken = result.NextPageToken
 	}
-	return all, nil
+
+	// Second pass: collect parents and their instances.
+	var blockers []*calendar.Event
+	for _, ev := range events {
+		if parentIDs[ev.Id] {
+			blockers = append(blockers, ev)
+		} else if ev.RecurringEventId != "" && parentIDs[ev.RecurringEventId] {
+			blockers = append(blockers, ev)
+		}
+	}
+	return blockers
 }
 
 func (c *Client) CreateEvent(ctx context.Context, calendarID string, event *calendar.Event) (*calendar.Event, error) {
