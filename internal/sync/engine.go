@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mbarney/gcalsync/internal/config"
 	"github.com/mbarney/gcalsync/internal/gcal"
@@ -22,9 +23,10 @@ type Engine struct {
 type ActionType string
 
 const (
-	ActionCreate ActionType = "create"
-	ActionUpdate ActionType = "update"
-	ActionDelete ActionType = "delete"
+	ActionCreate         ActionType = "create"
+	ActionUpdate         ActionType = "update"
+	ActionDelete         ActionType = "delete"
+	ActionUpdateInstance ActionType = "update_instance"
 )
 
 // PropertyDiff holds the old and new value of a single event property.
@@ -36,14 +38,15 @@ type PropertyDiff struct {
 // PlannedAction represents a single change the sync engine intends to make.
 type PlannedAction struct {
 	// Metadata (non-modifiable)
-	Action        ActionType `json:"action"`
-	CalendarID    string     `json:"calendar_id"`
-	AccountName   string     `json:"account_name"`
-	EventID       string     `json:"event_id,omitempty"`
-	InstanceID    string     `json:"instance_id,omitempty"`
-	SourceEventID string     `json:"source_event_id"`
-	EventType     string     `json:"event_type,omitempty"`
-	TimeZone      string     `json:"time_zone,omitempty"`
+	Action            ActionType `json:"action"`
+	CalendarID        string     `json:"calendar_id"`
+	AccountName       string     `json:"account_name"`
+	EventID       string `json:"event_id,omitempty"`
+	SourceEventID string `json:"source_event_id"`
+	EventType         string     `json:"event_type,omitempty"`
+	TimeZone          string     `json:"time_zone,omitempty"`
+	OriginalStartTime string     `json:"original_start_time,omitempty"` // instance occurrence key
+	ParentEventID     string     `json:"parent_event_id,omitempty"`     // existing blocker parent Google ID
 
 	// Diffable properties
 	Start          PropertyDiff `json:"start"`
@@ -67,7 +70,7 @@ func (p *SyncPlan) Counts() (creates, updates, deletes int) {
 		switch a.Action {
 		case ActionCreate:
 			creates++
-		case ActionUpdate:
+		case ActionUpdate, ActionUpdateInstance:
 			updates++
 		case ActionDelete:
 			deletes++
@@ -149,7 +152,7 @@ func (a *PlannedAction) print(verbose bool) {
 			}
 		}
 
-	case ActionUpdate:
+	case ActionUpdate, ActionUpdateInstance:
 		fmt.Printf("~ %s\n", header)
 		diffs := a.namedDiffs()
 		for _, d := range diffs {
@@ -252,6 +255,20 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 		}
 		desiredByID := make(map[string]*desired)
 
+		// Collect modified instances of recurring events.
+		type desiredInstance struct {
+			parentSourceID string
+			summary        string
+			description    string
+			start          string
+			end            string
+			eventType      string
+			timeZone       string
+			responseStatus string
+			originalStart  string
+		}
+		desiredInstances := make(map[string]*desiredInstance) // keyed by source instance event ID
+
 		for _, srcCalID := range allCalIDs {
 			if srcCalID == destCalID {
 				continue
@@ -271,8 +288,25 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 					continue
 				}
 
-				// Skip modified instances — they're handled via instance IDs on the parent.
+				// Collect modified instances separately for instance-level overrides.
 				if ev.RecurringEventId != "" {
+					status := responseStatus(ev, srcCalID)
+					di, exists := desiredInstances[ev.Id]
+					if !exists {
+						desiredInstances[ev.Id] = &desiredInstance{
+							parentSourceID: ev.RecurringEventId,
+							summary:        ev.Summary,
+							description:    ev.Description,
+							start:          formatEventDateTime(ev.Start),
+							end:            formatEventDateTime(ev.End),
+							eventType:      ev.EventType,
+							timeZone:       eventTimeZone(ev),
+							responseStatus: status,
+							originalStart:  formatEventDateTime(ev.OriginalStartTime),
+						}
+					} else {
+						di.responseStatus = strongestStatus(di.responseStatus, status)
+					}
 					continue
 				}
 
@@ -298,14 +332,34 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 			}
 		}
 
-		// Index existing blockers by source event ID.
+		// Index existing blocker parents by source event ID and by Google event ID.
 		blockerBySourceID := make(map[string]*calendar.Event)
+		blockerByGoogleID := make(map[string]*calendar.Event)
 		for _, b := range allBlockers[destCalID] {
+			if b.RecurringEventId != "" {
+				continue // skip blocker instances, index them below
+			}
 			if b.ExtendedProperties != nil && b.ExtendedProperties.Private != nil {
 				if srcID := b.ExtendedProperties.Private[gcal.PropSourceEventID]; srcID != "" {
 					blockerBySourceID[srcID] = b
+					blockerByGoogleID[b.Id] = b
 				}
 			}
+		}
+
+		// Index existing blocker instances by (parentSourceID, originalStart).
+		blockerInstanceByKey := make(map[string]*calendar.Event)
+		for _, b := range allBlockers[destCalID] {
+			if b.RecurringEventId == "" {
+				continue
+			}
+			parent, ok := blockerByGoogleID[b.RecurringEventId]
+			if !ok || parent.ExtendedProperties == nil || parent.ExtendedProperties.Private == nil {
+				continue
+			}
+			parentSourceID := parent.ExtendedProperties.Private[gcal.PropSourceEventID]
+			origStart := formatEventDateTime(b.OriginalStartTime)
+			blockerInstanceByKey[parentSourceID+"|"+origStart] = b
 		}
 
 		// Diff: compare desired state against existing blockers.
@@ -375,6 +429,78 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 					SourceEventID: srcID,
 					Summary:       PropertyDiff{Old: blocker.Summary},
 				})
+			}
+		}
+
+		// Process modified instances — create instance-level overrides where
+		// the instance properties differ from the parent blocker defaults.
+		for _, di := range desiredInstances {
+			parentDesired, hasParent := desiredByID[di.parentSourceID]
+			if !hasParent {
+				if e.Verbose {
+					log.Printf("[%s] skipping modified instance (parent skipped): %q", destCalID, di.summary)
+				}
+				continue
+			}
+
+			instanceSummary := di.summary + BlockerSuffix
+			visibility := e.Config.General.BlockEventVisibility
+
+			key := di.parentSourceID + "|" + di.originalStart
+			existingInstance, instanceExists := blockerInstanceByKey[key]
+
+			if instanceExists {
+				// Diff against existing blocker instance.
+				action := PlannedAction{
+					Action:            ActionUpdateInstance,
+					CalendarID:        destCalID,
+					AccountName:       destInfo.accountName,
+					EventID:           existingInstance.Id,
+					SourceEventID:     di.parentSourceID,
+					OriginalStartTime: di.originalStart,
+					EventType:         di.eventType,
+					TimeZone:          di.timeZone,
+					Start:             PropertyDiff{Old: formatEventDateTime(existingInstance.Start), New: di.start},
+					End:               PropertyDiff{Old: formatEventDateTime(existingInstance.End), New: di.end},
+					Summary:           PropertyDiff{Old: existingInstance.Summary, New: instanceSummary},
+					Description:       PropertyDiff{Old: existingInstance.Description, New: di.description},
+					Color:             PropertyDiff{Old: existingInstance.ColorId, New: BlockerColorID},
+					Visibility:        PropertyDiff{Old: existingInstance.Visibility, New: visibility},
+					ResponseStatus:    PropertyDiff{Old: existingResponseStatus(existingInstance, destCalID), New: di.responseStatus},
+				}
+				if action.hasChanges() {
+					plan.Actions = append(plan.Actions, action)
+				}
+			} else {
+				// New instance override — diff against parent defaults.
+				// ParentEventID is set if the blocker parent already exists;
+				// left empty if the parent is being created in this same plan
+				// (resolved at apply time).
+				parentEventID := ""
+				if existing := blockerBySourceID[di.parentSourceID]; existing != nil {
+					parentEventID = existing.Id
+				}
+
+				action := PlannedAction{
+					Action:            ActionUpdateInstance,
+					CalendarID:        destCalID,
+					AccountName:       destInfo.accountName,
+					ParentEventID:     parentEventID,
+					SourceEventID:     di.parentSourceID,
+					OriginalStartTime: di.originalStart,
+					EventType:         di.eventType,
+					TimeZone:          di.timeZone,
+					Start:             PropertyDiff{Old: di.start, New: di.start},
+					End:               PropertyDiff{Old: di.end, New: di.end},
+					Summary:           PropertyDiff{Old: parentDesired.summary + BlockerSuffix, New: instanceSummary},
+					Description:       PropertyDiff{Old: parentDesired.description, New: di.description},
+					Color:             PropertyDiff{Old: BlockerColorID, New: BlockerColorID},
+					Visibility:        PropertyDiff{Old: visibility, New: visibility},
+					ResponseStatus:    PropertyDiff{Old: parentDesired.responseStatus, New: di.responseStatus},
+				}
+				if action.hasChanges() {
+					plan.Actions = append(plan.Actions, action)
+				}
 			}
 		}
 	}
@@ -505,10 +631,32 @@ func (e *Engine) DesyncPlan(ctx context.Context, calendarID string) *SyncPlan {
 
 // Apply executes all actions in the plan. The plan is the sole source of truth —
 // no additional reads from Google Calendar are made.
+//
+// Execution is two-pass:
+//  1. create/update/delete actions — builds a resolution map of created parent IDs
+//  2. update_instance actions — resolves instance IDs from parent blocker IDs
 func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 	result := &ApplyResult{}
 
+	// Separate instance actions from regular actions.
+	var regular, instances []PlannedAction
 	for _, a := range plan.Actions {
+		if a.Action == ActionUpdateInstance {
+			instances = append(instances, a)
+		} else {
+			regular = append(regular, a)
+		}
+	}
+
+	// Pass 1: create/update/delete.
+	// Track created recurring blocker IDs for instance resolution.
+	type calSource struct {
+		calendarID    string
+		sourceEventID string
+	}
+	createdParentIDs := make(map[calSource]string)
+
+	for _, a := range regular {
 		client := e.Clients[a.AccountName]
 		if client == nil {
 			result.Errors = append(result.Errors, SyncError{
@@ -528,26 +676,26 @@ func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 		switch a.Action {
 		case ActionCreate:
 			ev := buildEventFromAction(a)
-			if _, err := client.CreateEvent(a.CalendarID, ev); err != nil {
+			created, err := client.CreateEvent(a.CalendarID, ev)
+			if err != nil {
 				result.Errors = append(result.Errors, SyncError{
 					Calendar: a.CalendarID,
 					Err:      fmt.Errorf("creating blocker for %q: %w", a.Summary.New, err),
 				})
 				continue
 			}
+			if a.Recurrence.New != "" {
+				createdParentIDs[calSource{a.CalendarID, a.SourceEventID}] = created.Id
+			}
 			log.Println(logLine)
 			result.Created++
 
 		case ActionUpdate:
 			ev := buildEventFromAction(a)
-			eventID := a.EventID
-			if a.InstanceID != "" {
-				eventID = a.InstanceID
-			}
-			if _, err := client.UpdateEvent(a.CalendarID, eventID, ev); err != nil {
+			if _, err := client.UpdateEvent(a.CalendarID, a.EventID, ev); err != nil {
 				result.Errors = append(result.Errors, SyncError{
 					Calendar: a.CalendarID,
-					EventID:  eventID,
+					EventID:  a.EventID,
 					Err:      fmt.Errorf("updating blocker for %q: %w", a.Summary.New, err),
 				})
 				continue
@@ -569,6 +717,55 @@ func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 		}
 	}
 
+	// Pass 2: update_instance actions.
+	for _, a := range instances {
+		client := e.Clients[a.AccountName]
+		if client == nil {
+			result.Errors = append(result.Errors, SyncError{
+				Calendar: a.CalendarID,
+				Err:      fmt.Errorf("no client for account %q", a.AccountName),
+			})
+			continue
+		}
+
+		// Resolve the instance ID.
+		instanceID := a.EventID // set when blocker instance already existed
+		if instanceID == "" {
+			// Resolve from parent blocker ID + original start time.
+			parentID := a.ParentEventID
+			if parentID == "" {
+				// Parent was created in pass 1.
+				parentID = createdParentIDs[calSource{a.CalendarID, a.SourceEventID}]
+			}
+			if parentID == "" {
+				result.Errors = append(result.Errors, SyncError{
+					Calendar: a.CalendarID,
+					Err:      fmt.Errorf("cannot resolve parent blocker for instance %q", a.Summary.New),
+				})
+				continue
+			}
+			instanceID = computeInstanceID(parentID, a.OriginalStartTime)
+		}
+
+		ev := buildEventFromAction(a)
+		summary := a.Summary.New
+		if summary == "" {
+			summary = a.Summary.Old
+		}
+		logLine := fmt.Sprintf("%s %s/%q (%s)", a.Action, a.CalendarID, summary, formatHumanTime(a))
+
+		if _, err := client.UpdateEvent(a.CalendarID, instanceID, ev); err != nil {
+			result.Errors = append(result.Errors, SyncError{
+				Calendar: a.CalendarID,
+				EventID:  instanceID,
+				Err:      fmt.Errorf("updating instance for %q: %w", a.Summary.New, err),
+			})
+			continue
+		}
+		log.Println(logLine)
+		result.Updated++
+	}
+
 	return result
 }
 
@@ -580,11 +777,15 @@ func buildEventFromAction(a PlannedAction) *calendar.Event {
 		Description: a.Description.New,
 		ColorId:     a.Color.New,
 		Reminders:   &calendar.EventReminders{UseDefault: false, ForceSendFields: []string{"UseDefault"}},
-		ExtendedProperties: &calendar.EventExtendedProperties{
+	}
+
+	// Only set extended properties on parent events, not instance overrides.
+	if a.Action != ActionUpdateInstance {
+		ev.ExtendedProperties = &calendar.EventExtendedProperties{
 			Private: map[string]string{
 				gcal.PropSourceEventID: a.SourceEventID,
 			},
-		},
+		}
 	}
 
 	ev.Start = parseEventDateTime(a.Start.New, a.TimeZone)
@@ -624,6 +825,25 @@ func parseEventDateTime(s string, timeZone string) *calendar.EventDateTime {
 		return &calendar.EventDateTime{Date: s, TimeZone: timeZone}
 	}
 	return &calendar.EventDateTime{DateTime: s, TimeZone: timeZone}
+}
+
+// computeInstanceID builds a Google Calendar instance ID from a parent event ID
+// and the original start time of the occurrence.
+// Format: {parentID}_{YYYYMMDDTHHMMSSZ} for timed events, {parentID}_{YYYYMMDD} for all-day.
+func computeInstanceID(parentID, originalStart string) string {
+	if parentID == "" || originalStart == "" {
+		return ""
+	}
+	// All-day: YYYY-MM-DD -> YYYYMMDD
+	if len(originalStart) == 10 && !strings.Contains(originalStart, "T") {
+		return parentID + "_" + strings.ReplaceAll(originalStart, "-", "")
+	}
+	// Timed: parse RFC3339, convert to UTC compact form
+	t, err := time.Parse(time.RFC3339, originalStart)
+	if err != nil {
+		return ""
+	}
+	return parentID + "_" + t.UTC().Format("20060102T150405Z")
 }
 
 // eventTimeZone extracts the timezone from a source event, preferring Start.TimeZone.
