@@ -142,9 +142,11 @@ func (a *PlannedAction) print(verbose bool) {
 	}
 	header := fmt.Sprintf("%s/%q (%s)", a.CalendarID, summary, formatHumanTime(*a))
 
-	fmtVal := formatDiffValue
-	if verbose {
-		fmtVal = formatDiffValueVerbose
+	fmtVal := func(name, value string) string {
+		if name == "description" && !verbose {
+			return formatDiffValueTruncated(value)
+		}
+		return formatDiffValue(value)
 	}
 
 	switch a.Action {
@@ -153,7 +155,7 @@ func (a *PlannedAction) print(verbose bool) {
 		diffs := a.namedDiffs()
 		for _, d := range diffs {
 			if d.diff.New != "" {
-				fmt.Printf("  + %s: %s\n", d.name, fmtVal(d.diff.New))
+				fmt.Printf("  + %s: %s\n", d.name, fmtVal(d.name, d.diff.New))
 			}
 		}
 
@@ -162,7 +164,7 @@ func (a *PlannedAction) print(verbose bool) {
 		diffs := a.namedDiffs()
 		for _, d := range diffs {
 			if d.diff.Old != d.diff.New {
-				fmt.Printf("  ~ %s: %s -> %s\n", d.name, fmtVal(d.diff.Old), fmtVal(d.diff.New))
+				fmt.Printf("  ~ %s: %s -> %s\n", d.name, fmtVal(d.name, d.diff.Old), fmtVal(d.name, d.diff.New))
 			}
 		}
 
@@ -498,8 +500,8 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 					OriginalStartTime: di.originalStart,
 					EventType:         di.eventType,
 					TimeZone:          di.timeZone,
-					Start:             PropertyDiff{Old: di.start, New: di.start},
-					End:               PropertyDiff{Old: di.end, New: di.end},
+					Start:             PropertyDiff{Old: di.originalStart, New: di.start},
+					End:               PropertyDiff{Old: di.originalStart, New: di.end},
 					Summary:           PropertyDiff{Old: parentDesired.summary + BlockerSuffix, New: instanceSummary},
 					Description:       PropertyDiff{Old: parentDesired.description, New: di.description},
 					Color:             PropertyDiff{Old: BlockerColorID, New: BlockerColorID},

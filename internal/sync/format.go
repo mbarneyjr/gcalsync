@@ -156,18 +156,16 @@ func humanDays(byDay string) string {
 	return strings.Join(names, ", ")
 }
 
-// formatDiffValue truncates a property value for display: first line only, max 24 chars.
+// formatDiffValue collapses newlines to \n for single-line display.
 func formatDiffValue(value string) string {
-	if i := strings.Index(value, "\n"); i != -1 {
-		value = value[:i]
-	}
+	return strings.ReplaceAll(value, "\n", "\\n")
+}
+
+// formatDiffValueTruncated collapses newlines and truncates to 24 chars (for description).
+func formatDiffValueTruncated(value string) string {
+	value = strings.ReplaceAll(value, "\n", "\\n")
 	if len(value) > 24 {
 		value = value[:24] + "..."
 	}
 	return value
-}
-
-// formatDiffValueVerbose collapses newlines to \n but does not truncate.
-func formatDiffValueVerbose(value string) string {
-	return strings.ReplaceAll(value, "\n", "\\n")
 }
