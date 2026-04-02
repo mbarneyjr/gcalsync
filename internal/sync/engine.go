@@ -442,6 +442,9 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 			}
 		}
 
+		// Track which blocker instances are matched by a source instance.
+		matchedBlockerInstances := make(map[string]bool)
+
 		// Process modified instances — create instance-level overrides where
 		// the instance properties differ from the parent blocker defaults.
 		for _, di := range desiredInstances {
@@ -458,6 +461,7 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 
 			key := di.parentSourceID + "|" + di.originalStart
 			existingInstance, instanceExists := blockerInstanceByKey[key]
+			matchedBlockerInstances[key] = true
 
 			if instanceExists {
 				// Diff against existing blocker instance.
@@ -511,6 +515,48 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 				if action.hasChanges() {
 					plan.Actions = append(plan.Actions, action)
 				}
+			}
+		}
+
+		// Detect blocker-side drift: blocker instances that were manually
+		// changed (e.g. declined) but have no corresponding source instance.
+		// Reset them back to parent defaults.
+		for key, blockerInst := range blockerInstanceByKey {
+			if matchedBlockerInstances[key] {
+				continue
+			}
+			parent, ok := blockerByGoogleID[blockerInst.RecurringEventId]
+			if !ok || parent.ExtendedProperties == nil || parent.ExtendedProperties.Private == nil {
+				continue
+			}
+			parentSourceID := parent.ExtendedProperties.Private[gcal.PropSourceEventID]
+			parentDesired, hasParent := desiredByID[parentSourceID]
+			if !hasParent {
+				continue
+			}
+
+			parentSummary := parentDesired.summary + BlockerSuffix
+			visibility := e.Config.General.BlockEventVisibility
+
+			action := PlannedAction{
+				Action:            ActionUpdateInstance,
+				CalendarID:        destCalID,
+				AccountName:       destInfo.accountName,
+				EventID:           blockerInst.Id,
+				SourceEventID:     parentSourceID,
+				OriginalStartTime: formatEventDateTime(blockerInst.OriginalStartTime),
+				EventType:         parentDesired.eventType,
+				TimeZone:          parentDesired.timeZone,
+				Start:             PropertyDiff{Old: formatEventDateTime(blockerInst.Start), New: formatEventDateTime(blockerInst.Start)},
+				End:               PropertyDiff{Old: formatEventDateTime(blockerInst.End), New: formatEventDateTime(blockerInst.End)},
+				Summary:           PropertyDiff{Old: blockerInst.Summary, New: parentSummary},
+				Description:       PropertyDiff{Old: blockerInst.Description, New: parentDesired.description},
+				Color:             PropertyDiff{Old: blockerInst.ColorId, New: BlockerColorID},
+				Visibility:        PropertyDiff{Old: blockerInst.Visibility, New: visibility},
+				ResponseStatus:    PropertyDiff{Old: existingResponseStatus(blockerInst, destCalID), New: parentDesired.responseStatus},
+			}
+			if action.hasChanges() {
+				plan.Actions = append(plan.Actions, action)
 			}
 		}
 	}
