@@ -78,7 +78,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	plan := engine.Plan(ctx)
-	plan.PrintPlan()
+	plan.PrintPlan(verbose)
 
 	if dryRun || plan.IsEmpty() {
 		if plan.IsEmpty() {

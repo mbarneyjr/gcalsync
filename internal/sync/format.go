@@ -166,3 +166,8 @@ func formatDiffValue(value string) string {
 	}
 	return value
 }
+
+// formatDiffValueVerbose collapses newlines to \n but does not truncate.
+func formatDiffValueVerbose(value string) string {
+	return strings.ReplaceAll(value, "\n", "\\n")
+}

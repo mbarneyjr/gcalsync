@@ -118,21 +118,26 @@ type SyncError struct {
 }
 
 // PrintPlan prints a human-readable summary of the plan.
-func (p *SyncPlan) PrintPlan() {
+func (p *SyncPlan) PrintPlan(verbose bool) {
 	if p.IsEmpty() {
 		return
 	}
 
 	for _, a := range p.Actions {
-		a.print()
+		a.print(verbose)
 	}
 
 	creates, updates, deletes := p.Counts()
 	fmt.Printf("\nPlan: %d to create, %d to update, %d to delete\n", creates, updates, deletes)
 }
 
-func (a *PlannedAction) print() {
+func (a *PlannedAction) print(verbose bool) {
 	header := fmt.Sprintf("%s/%q", a.CalendarID, a.Summary.New)
+
+	fmtVal := formatDiffValue
+	if verbose {
+		fmtVal = formatDiffValueVerbose
+	}
 
 	switch a.Action {
 	case ActionCreate:
@@ -140,7 +145,7 @@ func (a *PlannedAction) print() {
 		diffs := a.namedDiffs()
 		for _, d := range diffs {
 			if d.diff.New != "" {
-				fmt.Printf("  + %s: %s\n", d.name, formatDiffValue(d.diff.New))
+				fmt.Printf("  + %s: %s\n", d.name, fmtVal(d.diff.New))
 			}
 		}
 
@@ -149,7 +154,7 @@ func (a *PlannedAction) print() {
 		diffs := a.namedDiffs()
 		for _, d := range diffs {
 			if d.diff.Old != d.diff.New {
-				fmt.Printf("  ~ %s: %s -> %s\n", d.name, formatDiffValue(d.diff.Old), formatDiffValue(d.diff.New))
+				fmt.Printf("  ~ %s: %s -> %s\n", d.name, fmtVal(d.diff.Old), fmtVal(d.diff.New))
 			}
 		}
 

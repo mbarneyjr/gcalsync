@@ -66,7 +66,7 @@ func runDesync(cmd *cobra.Command, args []string) error {
 	}
 
 	plan := engine.DesyncPlan(ctx, desyncCalendar)
-	plan.PrintPlan()
+	plan.PrintPlan(verbose)
 
 	if plan.IsEmpty() {
 		fmt.Println("gcalsync: no blocker events to remove")
