@@ -35,6 +35,9 @@ func runServiceStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("Service: installed")
+	if status.Interval > 0 {
+		fmt.Printf("Interval: %s\n", status.Interval)
+	}
 	if status.Running {
 		fmt.Printf("Status: running (PID %d)\n", status.PID)
 	} else {

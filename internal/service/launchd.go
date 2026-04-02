@@ -27,6 +27,7 @@ type ServiceStatus struct {
 	Running   bool
 	PID       int
 	LastExit  int
+	Interval  time.Duration
 }
 
 func plistPath() string {
@@ -147,6 +148,21 @@ func (s *LaunchdService) Status() (*ServiceStatus, error) {
 		return status, nil
 	}
 	status.Installed = true
+
+	// Parse interval from plist.
+	if data, err := os.ReadFile(path); err == nil {
+		if idx := strings.Index(string(data), "<key>StartInterval</key>"); idx != -1 {
+			rest := string(data)[idx:]
+			if start := strings.Index(rest, "<integer>"); start != -1 {
+				rest = rest[start+len("<integer>"):]
+				if end := strings.Index(rest, "</integer>"); end != -1 {
+					if secs, err := strconv.Atoi(rest[:end]); err == nil {
+						status.Interval = time.Duration(secs) * time.Second
+					}
+				}
+			}
+		}
+	}
 
 	out, err := exec.Command("launchctl", "list").Output()
 	if err != nil {
