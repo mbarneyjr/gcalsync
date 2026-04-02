@@ -135,7 +135,11 @@ func (p *SyncPlan) PrintPlan(verbose bool) {
 }
 
 func (a *PlannedAction) print(verbose bool) {
-	header := fmt.Sprintf("%s/%q", a.CalendarID, a.Summary.New)
+	summary := a.Summary.New
+	if summary == "" {
+		summary = a.Summary.Old
+	}
+	header := fmt.Sprintf("%s/%q (%s)", a.CalendarID, summary, formatHumanTime(*a))
 
 	fmtVal := formatDiffValue
 	if verbose {
@@ -428,6 +432,9 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 					EventID:       blocker.Id,
 					SourceEventID: srcID,
 					Summary:       PropertyDiff{Old: blocker.Summary},
+					Start:         PropertyDiff{Old: formatEventDateTime(blocker.Start)},
+					End:           PropertyDiff{Old: formatEventDateTime(blocker.End)},
+					Recurrence:    PropertyDiff{Old: formatRecurrence(blocker.Recurrence)},
 				})
 			}
 		}
@@ -621,6 +628,8 @@ func (e *Engine) DesyncPlan(ctx context.Context, calendarID string) *SyncPlan {
 					EventID:     b.Id,
 					Summary:     PropertyDiff{Old: b.Summary},
 					Start:       PropertyDiff{Old: formatEventDateTime(b.Start)},
+					End:         PropertyDiff{Old: formatEventDateTime(b.End)},
+					Recurrence:  PropertyDiff{Old: formatRecurrence(b.Recurrence)},
 				})
 			}
 		}

@@ -12,7 +12,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var desyncCalendar string
+var (
+	desyncCalendar string
+	desyncDryRun   bool
+)
 
 var desyncCmd = &cobra.Command{
 	Use:   "desync",
@@ -22,6 +25,7 @@ var desyncCmd = &cobra.Command{
 
 func init() {
 	desyncCmd.Flags().StringVar(&desyncCalendar, "calendar", "", "only desync a specific calendar ID")
+	desyncCmd.Flags().BoolVar(&desyncDryRun, "dry-run", false, "show plan without applying")
 	rootCmd.AddCommand(desyncCmd)
 }
 
@@ -70,6 +74,10 @@ func runDesync(cmd *cobra.Command, args []string) error {
 
 	if plan.IsEmpty() {
 		fmt.Println("gcalsync: no blocker events to remove")
+		return nil
+	}
+
+	if desyncDryRun {
 		return nil
 	}
 
