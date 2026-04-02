@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mbarney/gcalsync/internal/config"
@@ -213,13 +214,13 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 				log.Printf("[%s/%s] listing events", accountName, calID)
 			}
 
-			events, err := client.ListEvents(calID)
+			events, err := client.ListEvents(ctx, calID)
 			if err != nil {
 				log.Printf("[%s/%s] error listing events: %v", accountName, calID, err)
 				continue
 			}
 
-			blockers, err := client.ListBlockers(calID)
+			blockers, err := client.ListBlockers(ctx, calID)
 			if err != nil {
 				log.Printf("[%s/%s] error listing blockers: %v", accountName, calID, err)
 				continue
@@ -582,7 +583,7 @@ func (e *Engine) DesyncPlan(ctx context.Context, calendarID string) *SyncPlan {
 	if calendarID != "" {
 		accountName := calAccount[calendarID]
 		if client := e.Clients[accountName]; client != nil {
-			events, err := client.ListEvents(calendarID)
+			events, err := client.ListEvents(ctx, calendarID)
 			if err != nil {
 				log.Printf("[%s] error listing events: %v", calendarID, err)
 			} else {
@@ -600,7 +601,7 @@ func (e *Engine) DesyncPlan(ctx context.Context, calendarID string) *SyncPlan {
 		}
 
 		for _, calID := range acct.Calendars {
-			blockers, err := client.ListAllBlockers(calID)
+			blockers, err := client.ListAllBlockers(ctx, calID)
 			if err != nil {
 				log.Printf("[%s] error listing blockers: %v", calID, err)
 				continue
@@ -646,6 +647,7 @@ func (e *Engine) DesyncPlan(ctx context.Context, calendarID string) *SyncPlan {
 //  2. update_instance actions — resolves instance IDs from parent blocker IDs
 func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 	result := &ApplyResult{}
+	var mu sync.Mutex // protects result fields
 
 	// Separate instance actions from regular actions.
 	var regular, instances []PlannedAction
@@ -657,123 +659,163 @@ func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 		}
 	}
 
-	// Pass 1: create/update/delete.
+	// Pass 1: create/update/delete — all actions run concurrently.
+	// The per-account rate limiter on each Client handles throttling.
 	// Track created recurring blocker IDs for instance resolution.
 	type calSource struct {
 		calendarID    string
 		sourceEventID string
 	}
+	var parentMu sync.Mutex // protects createdParentIDs
 	createdParentIDs := make(map[calSource]string)
 
+	var wg sync.WaitGroup
 	for _, a := range regular {
+		a := a // capture loop variable
 		client := e.Clients[a.AccountName]
 		if client == nil {
+			mu.Lock()
 			result.Errors = append(result.Errors, SyncError{
 				Calendar: a.CalendarID,
 				EventID:  a.EventID,
 				Err:      fmt.Errorf("no client for account %q", a.AccountName),
 			})
+			mu.Unlock()
 			continue
 		}
 
-		summary := a.Summary.New
-		if summary == "" {
-			summary = a.Summary.Old
-		}
-		logLine := fmt.Sprintf("%s %s/%q (%s)", a.Action, a.CalendarID, summary, formatHumanTime(a))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		switch a.Action {
-		case ActionCreate:
-			ev := buildEventFromAction(a)
-			created, err := client.CreateEvent(a.CalendarID, ev)
-			if err != nil {
-				result.Errors = append(result.Errors, SyncError{
-					Calendar: a.CalendarID,
-					Err:      fmt.Errorf("creating blocker for %q: %w", a.Summary.New, err),
-				})
-				continue
+			summary := a.Summary.New
+			if summary == "" {
+				summary = a.Summary.Old
 			}
-			if a.Recurrence.New != "" {
-				createdParentIDs[calSource{a.CalendarID, a.SourceEventID}] = created.Id
-			}
-			log.Println(logLine)
-			result.Created++
+			logLine := fmt.Sprintf("%s %s/%q (%s)", a.Action, a.CalendarID, summary, formatHumanTime(a))
 
-		case ActionUpdate:
-			ev := buildEventFromAction(a)
-			if _, err := client.UpdateEvent(a.CalendarID, a.EventID, ev); err != nil {
-				result.Errors = append(result.Errors, SyncError{
-					Calendar: a.CalendarID,
-					EventID:  a.EventID,
-					Err:      fmt.Errorf("updating blocker for %q: %w", a.Summary.New, err),
-				})
-				continue
-			}
-			log.Println(logLine)
-			result.Updated++
+			switch a.Action {
+			case ActionCreate:
+				ev := buildEventFromAction(a)
+				created, err := client.CreateEvent(ctx, a.CalendarID, ev)
+				if err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, SyncError{
+						Calendar: a.CalendarID,
+						Err:      fmt.Errorf("creating blocker for %q: %w", a.Summary.New, err),
+					})
+					mu.Unlock()
+					return
+				}
+				if a.Recurrence.New != "" {
+					parentMu.Lock()
+					createdParentIDs[calSource{a.CalendarID, a.SourceEventID}] = created.Id
+					parentMu.Unlock()
+				}
+				log.Println(logLine)
+				mu.Lock()
+				result.Created++
+				mu.Unlock()
 
-		case ActionDelete:
-			if err := client.DeleteEvent(a.CalendarID, a.EventID); err != nil {
-				result.Errors = append(result.Errors, SyncError{
-					Calendar: a.CalendarID,
-					EventID:  a.EventID,
-					Err:      fmt.Errorf("deleting blocker %q: %w", a.Summary.Old, err),
-				})
-				continue
+			case ActionUpdate:
+				ev := buildEventFromAction(a)
+				if _, err := client.UpdateEvent(ctx, a.CalendarID, a.EventID, ev); err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, SyncError{
+						Calendar: a.CalendarID,
+						EventID:  a.EventID,
+						Err:      fmt.Errorf("updating blocker for %q: %w", a.Summary.New, err),
+					})
+					mu.Unlock()
+					return
+				}
+				log.Println(logLine)
+				mu.Lock()
+				result.Updated++
+				mu.Unlock()
+
+			case ActionDelete:
+				if err := client.DeleteEvent(ctx, a.CalendarID, a.EventID); err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, SyncError{
+						Calendar: a.CalendarID,
+						EventID:  a.EventID,
+						Err:      fmt.Errorf("deleting blocker %q: %w", a.Summary.Old, err),
+					})
+					mu.Unlock()
+					return
+				}
+				log.Println(logLine)
+				mu.Lock()
+				result.Deleted++
+				mu.Unlock()
 			}
-			log.Println(logLine)
-			result.Deleted++
-		}
+		}()
 	}
+	wg.Wait()
 
-	// Pass 2: update_instance actions.
+	// Pass 2: update_instance actions — all run concurrently.
+	// Must wait for pass 1 to complete so createdParentIDs is fully populated.
 	for _, a := range instances {
+		a := a
 		client := e.Clients[a.AccountName]
 		if client == nil {
+			mu.Lock()
 			result.Errors = append(result.Errors, SyncError{
 				Calendar: a.CalendarID,
 				Err:      fmt.Errorf("no client for account %q", a.AccountName),
 			})
+			mu.Unlock()
 			continue
 		}
 
 		// Resolve the instance ID.
 		instanceID := a.EventID // set when blocker instance already existed
 		if instanceID == "" {
-			// Resolve from parent blocker ID + original start time.
 			parentID := a.ParentEventID
 			if parentID == "" {
-				// Parent was created in pass 1.
 				parentID = createdParentIDs[calSource{a.CalendarID, a.SourceEventID}]
 			}
 			if parentID == "" {
+				mu.Lock()
 				result.Errors = append(result.Errors, SyncError{
 					Calendar: a.CalendarID,
 					Err:      fmt.Errorf("cannot resolve parent blocker for instance %q", a.Summary.New),
 				})
+				mu.Unlock()
 				continue
 			}
 			instanceID = computeInstanceID(parentID, a.OriginalStartTime)
 		}
 
-		ev := buildEventFromAction(a)
-		summary := a.Summary.New
-		if summary == "" {
-			summary = a.Summary.Old
-		}
-		logLine := fmt.Sprintf("%s %s/%q (%s)", a.Action, a.CalendarID, summary, formatHumanTime(a))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-		if _, err := client.UpdateEvent(a.CalendarID, instanceID, ev); err != nil {
-			result.Errors = append(result.Errors, SyncError{
-				Calendar: a.CalendarID,
-				EventID:  instanceID,
-				Err:      fmt.Errorf("updating instance for %q: %w", a.Summary.New, err),
-			})
-			continue
-		}
-		log.Println(logLine)
-		result.Updated++
+			ev := buildEventFromAction(a)
+			summary := a.Summary.New
+			if summary == "" {
+				summary = a.Summary.Old
+			}
+			logLine := fmt.Sprintf("%s %s/%q (%s)", a.Action, a.CalendarID, summary, formatHumanTime(a))
+
+			if _, err := client.UpdateEvent(ctx, a.CalendarID, instanceID, ev); err != nil {
+				mu.Lock()
+				result.Errors = append(result.Errors, SyncError{
+					Calendar: a.CalendarID,
+					EventID:  instanceID,
+					Err:      fmt.Errorf("updating instance for %q: %w", a.Summary.New, err),
+				})
+				mu.Unlock()
+				return
+			}
+			log.Println(logLine)
+			mu.Lock()
+			result.Updated++
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 
 	return result
 }

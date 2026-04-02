@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/api/calendar/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -15,11 +16,17 @@ import (
 const (
 	PropSourceEventID    = "gcalsync_source_event_id"
 	PropSourceCalendarID = "gcalsync_source_calendar_id"
+
+	// Google Calendar API allows 500 requests per 100 seconds per user.
+	// We set slightly below that to avoid hitting the limit.
+	rateLimitPerSecond = 4.5
+	rateLimitBurst     = 5
 )
 
 type Client struct {
 	Service     *calendar.Service
 	AccountName string
+	limiter     *rate.Limiter
 }
 
 func NewClient(ctx context.Context, httpClient *http.Client, accountName string) (*Client, error) {
@@ -27,10 +34,19 @@ func NewClient(ctx context.Context, httpClient *http.Client, accountName string)
 	if err != nil {
 		return nil, fmt.Errorf("creating calendar service for %s: %w", accountName, err)
 	}
-	return &Client{Service: svc, AccountName: accountName}, nil
+	return &Client{
+		Service:     svc,
+		AccountName: accountName,
+		limiter:     rate.NewLimiter(rate.Limit(rateLimitPerSecond), rateLimitBurst),
+	}, nil
 }
 
-func (c *Client) ListEvents(calendarID string) ([]*calendar.Event, error) {
+// wait blocks until the rate limiter allows a request.
+func (c *Client) wait(ctx context.Context) error {
+	return c.limiter.Wait(ctx)
+}
+
+func (c *Client) ListEvents(ctx context.Context, calendarID string) ([]*calendar.Event, error) {
 	now := time.Now()
 	timeMin := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	timeMax := timeMin.AddDate(0, 2, 0)
@@ -38,6 +54,9 @@ func (c *Client) ListEvents(calendarID string) ([]*calendar.Event, error) {
 	var all []*calendar.Event
 	pageToken := ""
 	for {
+		if err := c.wait(ctx); err != nil {
+			return nil, err
+		}
 		call := c.Service.Events.List(calendarID).
 			SingleEvents(false).
 			TimeMin(timeMin.Format(time.RFC3339)).
@@ -61,7 +80,7 @@ func (c *Client) ListEvents(calendarID string) ([]*calendar.Event, error) {
 	return all, nil
 }
 
-func (c *Client) ListBlockers(calendarID string) ([]*calendar.Event, error) {
+func (c *Client) ListBlockers(ctx context.Context, calendarID string) ([]*calendar.Event, error) {
 	now := time.Now()
 	timeMin := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	timeMax := timeMin.AddDate(0, 2, 0)
@@ -69,6 +88,9 @@ func (c *Client) ListBlockers(calendarID string) ([]*calendar.Event, error) {
 	var all []*calendar.Event
 	pageToken := ""
 	for {
+		if err := c.wait(ctx); err != nil {
+			return nil, err
+		}
 		call := c.Service.Events.List(calendarID).
 			SingleEvents(false).
 			Q("[gcalsync]").
@@ -98,7 +120,10 @@ func (c *Client) ListBlockers(calendarID string) ([]*calendar.Event, error) {
 	return all, nil
 }
 
-func (c *Client) CreateEvent(calendarID string, event *calendar.Event) (*calendar.Event, error) {
+func (c *Client) CreateEvent(ctx context.Context, calendarID string, event *calendar.Event) (*calendar.Event, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
 	created, err := c.Service.Events.Insert(calendarID, event).
 		SendNotifications(false).Do()
 	if err != nil {
@@ -107,7 +132,10 @@ func (c *Client) CreateEvent(calendarID string, event *calendar.Event) (*calenda
 	return created, nil
 }
 
-func (c *Client) UpdateEvent(calendarID string, eventID string, event *calendar.Event) (*calendar.Event, error) {
+func (c *Client) UpdateEvent(ctx context.Context, calendarID string, eventID string, event *calendar.Event) (*calendar.Event, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
 	updated, err := c.Service.Events.Update(calendarID, eventID, event).
 		SendNotifications(false).Do()
 	if err != nil {
@@ -116,7 +144,10 @@ func (c *Client) UpdateEvent(calendarID string, eventID string, event *calendar.
 	return updated, nil
 }
 
-func (c *Client) DeleteEvent(calendarID string, eventID string) error {
+func (c *Client) DeleteEvent(ctx context.Context, calendarID string, eventID string) error {
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
 	err := c.Service.Events.Delete(calendarID, eventID).
 		SendNotifications(false).Do()
 	if err != nil {
@@ -130,7 +161,10 @@ func (c *Client) DeleteEvent(calendarID string, eventID string) error {
 	return nil
 }
 
-func (c *Client) GetEvent(calendarID string, eventID string) (*calendar.Event, error) {
+func (c *Client) GetEvent(ctx context.Context, calendarID string, eventID string) (*calendar.Event, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
 	ev, err := c.Service.Events.Get(calendarID, eventID).Do()
 	if err != nil {
 		if apiErr, ok := err.(*googleapi.Error); ok {
@@ -143,7 +177,10 @@ func (c *Client) GetEvent(calendarID string, eventID string) (*calendar.Event, e
 	return ev, nil
 }
 
-func (c *Client) UpdateInstance(calendarID string, instanceID string, event *calendar.Event) (*calendar.Event, error) {
+func (c *Client) UpdateInstance(ctx context.Context, calendarID string, instanceID string, event *calendar.Event) (*calendar.Event, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
 	updated, err := c.Service.Events.Update(calendarID, instanceID, event).
 		SendNotifications(false).Do()
 	if err != nil {
@@ -152,10 +189,13 @@ func (c *Client) UpdateInstance(calendarID string, instanceID string, event *cal
 	return updated, nil
 }
 
-func (c *Client) ListAllBlockers(calendarID string) ([]*calendar.Event, error) {
+func (c *Client) ListAllBlockers(ctx context.Context, calendarID string) ([]*calendar.Event, error) {
 	var all []*calendar.Event
 	pageToken := ""
 	for {
+		if err := c.wait(ctx); err != nil {
+			return nil, err
+		}
 		call := c.Service.Events.List(calendarID).
 			SingleEvents(false).
 			Q("[gcalsync]").
