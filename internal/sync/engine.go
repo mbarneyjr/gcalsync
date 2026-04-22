@@ -233,6 +233,31 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 		}
 	}
 
+	// Build a set of native (non-blocker) event IDs per calendar.
+	// Used to detect when a destination calendar already has an event natively
+	// (e.g., shared meetings with the same iCalUID/event ID), even if the source
+	// calendar's copy doesn't show the destination in its attendee list
+	// (privateCopy events hide attendees across org boundaries).
+	nativeEventIDs := make(map[string]map[string]bool) // calID -> set of event IDs
+	blockerIDs := make(map[string]map[string]bool)      // calID -> set of blocker event IDs
+	for calID, blockers := range allBlockers {
+		ids := make(map[string]bool, len(blockers))
+		for _, b := range blockers {
+			ids[b.Id] = true
+		}
+		blockerIDs[calID] = ids
+	}
+	for calID, events := range allEvents {
+		native := make(map[string]bool)
+		bids := blockerIDs[calID]
+		for _, ev := range events {
+			if !bids[ev.Id] && !strings.Contains(ev.Summary, "[gcalsync]") {
+				native[ev.Id] = true
+			}
+		}
+		nativeEventIDs[calID] = native
+	}
+
 	var allCalIDs []string
 	for _, acct := range e.Config.Accounts {
 		allCalIDs = append(allCalIDs, acct.Calendars...)
@@ -287,6 +312,21 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 				if skip, reason := ShouldSkipForDest(ev, destCalID, destInfo.enterprise); skip {
 					if e.Verbose {
 						log.Printf("[%s -> %s] skipping %q (%s)", srcCalID, destCalID, ev.Summary, reason)
+					}
+					continue
+				}
+
+				// Skip if destination calendar already has this event natively.
+				// This handles privateCopy events where the source calendar's
+				// attendee list doesn't include the destination, but the
+				// destination has the event via a direct invitation.
+				eventIDToCheck := ev.Id
+				if ev.RecurringEventId != "" {
+					eventIDToCheck = ev.RecurringEventId
+				}
+				if nativeEventIDs[destCalID][eventIDToCheck] {
+					if e.Verbose {
+						log.Printf("[%s -> %s] skipping %q (destination has event natively)", srcCalID, destCalID, ev.Summary)
 					}
 					continue
 				}
