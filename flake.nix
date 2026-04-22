@@ -23,7 +23,7 @@
             pname = "gcalsync";
             version = "0.0.0";
             src = ./.;
-            vendorHash = "sha256-O0xXpc0YDgUcueFCnFUCiLZ6Q/87IpxdZluwK82kLKg=";
+            vendorHash = "sha256-Afo78pHn4/1MD8Ek76KwTHDcmt3a23y0eQhQ2wN/HTA=";
           };
 
           devShells.default = pkgs.mkShell {
