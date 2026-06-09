@@ -46,10 +46,18 @@ func (c *Client) wait(ctx context.Context) error {
 	return c.limiter.Wait(ctx)
 }
 
-func (c *Client) ListEvents(ctx context.Context, calendarID string) ([]*calendar.Event, error) {
+// defaultWindow returns the time range scanned by event/instance listing:
+// from the start of the current month to two months later. ListEvents and
+// ListInstances MUST share this window — prune decisions in the sync engine
+// compare the two and would be wrong if they drifted.
+func defaultWindow() (time.Time, time.Time) {
 	now := time.Now()
 	timeMin := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-	timeMax := timeMin.AddDate(0, 2, 0)
+	return timeMin, timeMin.AddDate(0, 2, 0)
+}
+
+func (c *Client) ListEvents(ctx context.Context, calendarID string) ([]*calendar.Event, error) {
+	timeMin, timeMax := defaultWindow()
 
 	var all []*calendar.Event
 	pageToken := ""
@@ -135,6 +143,27 @@ func (c *Client) UpdateEvent(ctx context.Context, calendarID string, eventID str
 	return updated, nil
 }
 
+// PatchEvent applies a partial update to an event, leaving unspecified fields
+// untouched. Used to cancel a single occurrence of a recurring blocker by
+// patching status to "cancelled". A virtual instance that was never materialized
+// (or is already cancelled) may return 404/410, which is treated as success.
+func (c *Client) PatchEvent(ctx context.Context, calendarID string, eventID string, event *calendar.Event) (*calendar.Event, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
+	patched, err := c.Service.Events.Patch(calendarID, eventID, event).
+		SendNotifications(false).Do()
+	if err != nil {
+		if apiErr, ok := err.(*googleapi.Error); ok {
+			if apiErr.Code == 404 || apiErr.Code == 410 {
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("patching event %s on %s: %w", eventID, calendarID, err)
+	}
+	return patched, nil
+}
+
 func (c *Client) DeleteEvent(ctx context.Context, calendarID string, eventID string) error {
 	if err := c.wait(ctx); err != nil {
 		return err
@@ -202,6 +231,53 @@ func (c *Client) ListAllBlockers(ctx context.Context, calendarID string) ([]*cal
 
 		for _, ev := range result.Items {
 			if strings.Contains(ev.Summary, "[gcalsync]") {
+				all = append(all, ev)
+			}
+		}
+
+		if result.NextPageToken == "" {
+			break
+		}
+		pageToken = result.NextPageToken
+	}
+	return all, nil
+}
+
+// ListInstances expands a recurring event into its live (non-cancelled)
+// occurrences within the same time window used by ListEvents. It is used to
+// decide whether a recurring event still has anything to block — a series whose
+// every in-window occurrence has been cancelled returns zero instances.
+func (c *Client) ListInstances(ctx context.Context, calendarID string, eventID string) ([]*calendar.Event, error) {
+	timeMin, timeMax := defaultWindow()
+
+	var all []*calendar.Event
+	pageToken := ""
+	for {
+		if err := c.wait(ctx); err != nil {
+			return nil, err
+		}
+		// A 2-month window cannot hold more than 2500 occurrences of any real
+		// series, so a single page always covers it; the paging loop below is
+		// defensive only.
+		call := c.Service.Events.Instances(calendarID, eventID).
+			TimeMin(timeMin.Format(time.RFC3339)).
+			TimeMax(timeMax.Format(time.RFC3339)).
+			MaxResults(2500)
+		if pageToken != "" {
+			call = call.PageToken(pageToken)
+		}
+
+		result, err := call.Do()
+		if err != nil {
+			if apiErr, ok := err.(*googleapi.Error); ok {
+				if apiErr.Code == 404 || apiErr.Code == 410 {
+					return nil, nil // series gone entirely
+				}
+			}
+			return nil, fmt.Errorf("listing instances of %s on %s: %w", eventID, calendarID, err)
+		}
+		for _, ev := range result.Items {
+			if ev.Status != "cancelled" {
 				all = append(all, ev)
 			}
 		}

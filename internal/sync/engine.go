@@ -28,6 +28,7 @@ const (
 	ActionUpdate         ActionType = "update"
 	ActionDelete         ActionType = "delete"
 	ActionUpdateInstance ActionType = "update_instance"
+	ActionCancelInstance ActionType = "cancel_instance"
 )
 
 // PropertyDiff holds the old and new value of a single event property.
@@ -73,7 +74,7 @@ func (p *SyncPlan) Counts() (creates, updates, deletes int) {
 			creates++
 		case ActionUpdate, ActionUpdateInstance:
 			updates++
-		case ActionDelete:
+		case ActionDelete, ActionCancelInstance:
 			deletes++
 		}
 	}
@@ -170,6 +171,9 @@ func (a *PlannedAction) print(verbose bool) {
 
 	case ActionDelete:
 		fmt.Printf("- %s\n", header)
+
+	case ActionCancelInstance:
+		fmt.Printf("- %s [instance cancelled]\n", header)
 	}
 }
 
@@ -280,6 +284,7 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 			recurrence     string
 			responseStatus string
 			isRecurring    bool
+			srcCalID       string // a source calendar this event lives on (for instance expansion)
 		}
 		desiredByID := make(map[string]*desired)
 
@@ -297,12 +302,44 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 		}
 		desiredInstances := make(map[string]*desiredInstance) // keyed by source instance event ID
 
+		// Collect cancelled instances of recurring events so we can cancel the
+		// matching blocker instance. Keyed by parentSourceID+"|"+originalStart.
+		type cancelledInstance struct {
+			parentSourceID string
+			originalStart  string
+			summary        string // source occurrence summary, if Google still reports it
+		}
+		cancelledInstances := make(map[string]cancelledInstance)
+
 		for _, srcCalID := range allCalIDs {
 			if srcCalID == destCalID {
 				continue
 			}
 
 			for _, ev := range allEvents[srcCalID] {
+				// A cancelled instance of a recurring event must be propagated as
+				// a cancellation of the matching blocker instance. ShouldSkip would
+				// otherwise discard it, leaving an orphaned blocker occurrence.
+				if ev.Status == "cancelled" && ev.RecurringEventId != "" {
+					origStart := formatEventDateTime(ev.OriginalStartTime)
+					if origStart == "" {
+						// Without an OriginalStartTime we can't key the occurrence,
+						// so the matching blocker instance can't be located. Surface
+						// it rather than silently dropping the cancellation.
+						if e.Verbose {
+							log.Printf("[%s -> %s] cancelled instance of %s has no OriginalStartTime; blocker occurrence may be left orphaned", srcCalID, destCalID, ev.RecurringEventId)
+						}
+						continue
+					}
+					key := ev.RecurringEventId + "|" + origStart
+					cancelledInstances[key] = cancelledInstance{
+						parentSourceID: ev.RecurringEventId,
+						originalStart:  origStart,
+						summary:        ev.Summary,
+					}
+					continue
+				}
+
 				if skip, reason := ShouldSkip(ev, e.Config.General.IgnoreBirthdays); skip {
 					if e.Verbose {
 						log.Printf("[%s -> %s] skipping %q (%s)", srcCalID, destCalID, ev.Summary, reason)
@@ -367,6 +404,7 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 						recurrence:     formatRecurrence(ev.Recurrence),
 						responseStatus: status,
 						isRecurring:    len(ev.Recurrence) > 0,
+						srcCalID:       srcCalID,
 					}
 				} else {
 					// Pick the strongest response status across source calendars.
@@ -427,6 +465,41 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 			parentSourceID := parent.ExtendedProperties.Private[gcal.PropSourceEventID]
 			origStart := formatEventDateTime(b.OriginalStartTime)
 			blockerInstanceByKey[parentSourceID+"|"+origStart] = b
+		}
+
+		// Prune recurring parents whose every in-window occurrence has been
+		// cancelled. Creating a blocker for such a series and then cancelling its
+		// only instances would leave an empty recurring event that Google reaps —
+		// recreated on every sync (a create/cancel flip-flop). If nothing survives,
+		// drop it from the desired set so it is never created (and any stale blocker
+		// is removed by the unmatched-delete pass below).
+		prunedParents := make(map[string]bool) // parentSourceID -> already expanded
+		for _, ci := range cancelledInstances {
+			if prunedParents[ci.parentSourceID] {
+				continue // a series with N cancelled occurrences needs only one expansion
+			}
+			prunedParents[ci.parentSourceID] = true
+			d, ok := desiredByID[ci.parentSourceID]
+			if !ok || !d.isRecurring || d.srcCalID == "" {
+				continue
+			}
+			client := e.Clients[calInfoMap[d.srcCalID].accountName]
+			if client == nil {
+				continue
+			}
+			live, err := client.ListInstances(ctx, d.srcCalID, ci.parentSourceID)
+			if err != nil {
+				if e.Verbose {
+					log.Printf("[%s] could not expand instances for %s: %v", destCalID, ci.parentSourceID, err)
+				}
+				continue // on error, leave desired as-is (pre-fix behavior)
+			}
+			if len(live) == 0 {
+				if e.Verbose {
+					log.Printf("[%s] dropping %q: all in-window occurrences cancelled", destCalID, d.summary)
+				}
+				delete(desiredByID, ci.parentSourceID)
+			}
 		}
 
 		// Diff: compare desired state against existing blockers.
@@ -581,12 +654,82 @@ func (e *Engine) Plan(ctx context.Context) *SyncPlan {
 			}
 		}
 
+		// Cancelled source instances: cancel the matching blocker instance so a
+		// removed occurrence doesn't leave an orphaned blocker. Marking the key as
+		// matched keeps the drift-reset loop below from un-cancelling it.
+		for key, ci := range cancelledInstances {
+			matchedBlockerInstances[key] = true
+
+			// An already-cancelled blocker instance is a no-op regardless.
+			if existing, ok := blockerInstanceByKey[key]; ok && existing.Status == "cancelled" {
+				continue
+			}
+
+			// Only cancel an occurrence when the parent blocker will continue to
+			// exist. If the parent is no longer desired, the whole blocker is
+			// removed by the unmatched-delete pass — cancelling an instance of an
+			// event that's about to be deleted is pointless (and a series whose
+			// every occurrence was cancelled has already been pruned above).
+			parentDesiredEntry, parentDesired := desiredByID[ci.parentSourceID]
+			if !parentDesired {
+				continue
+			}
+			parentBlocker, hasBlocker := blockerBySourceID[ci.parentSourceID]
+
+			// Best-effort human label for the cancelled occurrence: prefer the
+			// source occurrence summary, fall back to the parent's name.
+			label := ci.summary
+			if label == "" {
+				label = parentDesiredEntry.summary
+			}
+			if label != "" {
+				label += BlockerSuffix
+			}
+
+			if existing, ok := blockerInstanceByKey[key]; ok {
+				if label == "" {
+					label = existing.Summary
+				}
+				plan.Actions = append(plan.Actions, PlannedAction{
+					Action:            ActionCancelInstance,
+					CalendarID:        destCalID,
+					AccountName:       destInfo.accountName,
+					EventID:           existing.Id,
+					SourceEventID:     ci.parentSourceID,
+					OriginalStartTime: ci.originalStart,
+					Summary:           PropertyDiff{Old: label},
+					Start:             PropertyDiff{Old: ci.originalStart},
+				})
+				continue
+			}
+
+			// No materialized blocker instance yet — resolve the parent at execute
+			// time (it may be created earlier in this same run).
+			parentEventID := ""
+			if hasBlocker {
+				parentEventID = parentBlocker.Id
+			}
+			plan.Actions = append(plan.Actions, PlannedAction{
+				Action:            ActionCancelInstance,
+				CalendarID:        destCalID,
+				AccountName:       destInfo.accountName,
+				ParentEventID:     parentEventID,
+				SourceEventID:     ci.parentSourceID,
+				OriginalStartTime: ci.originalStart,
+				Summary:           PropertyDiff{Old: label},
+				Start:             PropertyDiff{Old: ci.originalStart},
+			})
+		}
+
 		// Detect blocker-side drift: blocker instances that were manually
 		// changed (e.g. declined) but have no corresponding source instance.
 		// Reset them back to parent defaults.
 		for key, blockerInst := range blockerInstanceByKey {
 			if matchedBlockerInstances[key] {
 				continue
+			}
+			if blockerInst.Status == "cancelled" {
+				continue // never resurrect a cancelled blocker instance
 			}
 			parent, ok := blockerByGoogleID[blockerInst.RecurringEventId]
 			if !ok || parent.ExtendedProperties == nil || parent.ExtendedProperties.Private == nil {
@@ -763,7 +906,7 @@ func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 	// Separate instance actions from regular actions.
 	var regular, instances []PlannedAction
 	for _, a := range plan.Actions {
-		if a.Action == ActionUpdateInstance {
+		if a.Action == ActionUpdateInstance || a.Action == ActionCancelInstance {
 			instances = append(instances, a)
 		} else {
 			regular = append(regular, a)
@@ -903,13 +1046,41 @@ func (e *Engine) Apply(ctx context.Context, plan *SyncPlan) *ApplyResult {
 		go func() {
 			defer wg.Done()
 
-			ev := buildEventFromAction(a)
 			summary := a.Summary.New
 			if summary == "" {
 				summary = a.Summary.Old
 			}
 			logLine := fmt.Sprintf("%s %s/%q (%s)", a.Action, a.CalendarID, summary, formatHumanTime(a))
 
+			if a.Action == ActionCancelInstance {
+				// Cancel just this occurrence of the recurring blocker. Patching a
+				// virtual (never-materialized) instance ID is valid and idempotent;
+				// PatchEvent swallows 404/410 if it's already gone.
+				patched, err := client.PatchEvent(ctx, a.CalendarID, instanceID, &calendar.Event{Status: "cancelled"})
+				if err != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, SyncError{
+						Calendar: a.CalendarID,
+						EventID:  instanceID,
+						Err:      fmt.Errorf("cancelling instance %q: %w", summary, err),
+					})
+					mu.Unlock()
+					return
+				}
+				if patched == nil && e.Verbose {
+					// 404/410 swallowed: no live occurrence matched this instance ID.
+					// Either it was already gone, or the ID was mis-derived (wrong
+					// timezone/seconds) and the orphan blocker still exists. Surface it.
+					log.Printf("[%s] cancel instance %q: no occurrence matched ID %q (404/410), nothing cancelled", a.CalendarID, summary, instanceID)
+				}
+				log.Println(logLine)
+				mu.Lock()
+				result.Deleted++
+				mu.Unlock()
+				return
+			}
+
+			ev := buildEventFromAction(a)
 			if _, err := client.UpdateEvent(ctx, a.CalendarID, instanceID, ev); err != nil {
 				mu.Lock()
 				result.Errors = append(result.Errors, SyncError{
